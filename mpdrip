@@ -10,7 +10,7 @@ three reasons:
 1. MPD maintains its own song database and can only play from that database.
    That makes it cumbersome to quickly add a song to your playlist.
 2. MPDRIP's author has a very specific view on how "crossfading" is supposed to
-   work. No music player that I know of does it properly.
+   work. No music player that I know of does it properly. This one does.
 3. This is the author's first real attempt to write anything substantial in
    Python, and also his first steps on the path of multi-threaded programming.
    You can consider it a programming exercise.

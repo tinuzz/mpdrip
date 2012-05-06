@@ -47,6 +47,7 @@ import glob
 import errno
 import shlex
 import json
+import lockfile
 
 import glib, gobject
 import pygst
@@ -68,6 +69,8 @@ def handle_signal (sig, _frame):
         app.logger.warning("Setting log level to 'DEBUG")
         app.logger.setLevel(logging.DEBUG)
     else:
+        app.logger.debug ("Writing state file")
+        app.controller.state.write_to_file()
         app.logger.warning ("Exiting...")
         app.logger.debug ("Shutting down server")
         app.server.shutdown()
@@ -102,6 +105,46 @@ class ThreadedTCPServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
     allow_reuse_address = True
     pass
 
+class Statekeeper:
+
+    playlist = []
+    lastcued = -1
+    current_song = 0
+    position = 0
+    volume = 0.9
+
+    def __init__(self):
+        self.read_from_file()
+
+    def read_from_file (self):
+        if os.path.exists (app.statefile):
+            app.logger.info ("Reading state file (%s)" % app.statefile)
+            try:
+                fp = open (app.statefile, 'r')
+                try:
+                    state = json.load (fp)
+                    self.__dict__ = state
+                except ValueError, err:
+                    app.logger.info(err)
+
+                app.logger.debug("State: %s" % pprint.pformat (self.__dict__))
+                fp.close()
+            except IOError, err:
+                app.logger.error("Could not read state file (%s)" % err)
+
+    def write_to_file (self):
+        app.logger.info ("Writing state file (%s)" % app.statefile)
+        lock = lockfile.FileLock (app.statefile)
+        lock.acquire()
+        app.logger.debug ("Lock on state file (%s) acquired" % app.statefile)
+        try:
+            fp = open (app.statefile, 'w')
+            json.dump (self.__dict__, fp)
+            fp.close()
+        except IOError, err:
+            app.logger.error("Could not write state file (%s)" % err)
+        lock.release()
+
 class Player:
 
     def __init__(self, name):
@@ -110,6 +153,7 @@ class Player:
         self.name          = name
         self.loaded        = False
         self.start_on_cue  = False
+        self.song_index    = False
         self.duration      = 0
         self.beginoff      = 0
         self.song          = {}
@@ -143,8 +187,7 @@ class Player:
         decode.link(convert)
         print "Player class: %s linked!" % self.name
         if self.start_on_cue:
-            print "Setting %s to PLAYING" % self.name
-            self.pipeline.set_state(gst.STATE_PLAYING)
+            self.play()
             self.start_on_cue = False
 
     def on_message(self, bus, message):
@@ -160,9 +203,10 @@ class Player:
 
         app.controller.on_message(self, bus, message)
 
-    def load (self, song, start_on_cue):
+    def load (self, song, start_on_cue, song_index):
         app.logger.debug ("Entering %s::load()" % self.__class__.__name__)
         if os.path.exists(song['file']):
+            self.song_index = song_index
             self.song = song
             app.logger.info ("Loading file %s" % song['file'])
             self.pipeline.set_state(gst.STATE_READY)
@@ -179,9 +223,12 @@ class Player:
     def _discovered (self, discoverer, ismedia):
             secs = int(discoverer.audiolength / 1000000000)
             app.logger.info ("Discovered: %s last %s seconds" % (self.song['file'], secs))
-            app.logger.debug (pprint.pformat(discoverer.tags))
             self.duration = secs
-            self.beginoff = self.song['seek']
+            app.controller.update_meta(self.song_index, discoverer)
+            try:
+                self.beginoff = self.song['seek']
+            except KeyError:
+                self.beginoff = 0
             app.logger.debug ("Setting %s to PAUSED" % self.name)
             self.pipeline.set_state(gst.STATE_PAUSED)
             self.loaded = True
@@ -193,15 +240,21 @@ class Player:
         self.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, seek_ns)
 
     def play (self):
-        seek_ns = self.beginoff * 1000000000
-        self.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, seek_ns)
+        #seek_ns = self.beginoff * 1000000000
+        #self.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, seek_ns)
         app.logger.debug ("Setting %s to PLAYING" % self.name)
         self.pipeline.set_state(gst.STATE_PLAYING)
+        app.controller.active = self
+        app.controller.state.current_song = self.song_index
 
     def stop (self):
         app.logger.debug ("Setting %s to NULL (stopping)" % self.name)
         self.pipeline.set_state(gst.STATE_NULL)
         self.loaded = False
+
+    def pause (self):
+        app.logger.debug ("Setting %s to PAUSED" % self.name)
+        self.pipeline.set_state(gst.STATE_PAUSED)
 
 class NetworkServer(SocketServer.BaseRequestHandler):
 
@@ -211,12 +264,22 @@ class NetworkServer(SocketServer.BaseRequestHandler):
         for filename in args:
             if os.path.exists(filename):
                 self.request.sendall("Adding " + filename + "\n")
-                app.controller.playlist.append([filename, 200, 0])
+                app.controller.state.playlist.append({ 'file': filename})
+                app.controller.state.write_to_file()
+                app.controller.cue_next2()
             else:
                 self.request.sendall("File does not exist\n")
 
+    def handle_play_cmd (self):
+        app.controller.play()
+        self.request.sendall("OK\n")
+
     def handle_stop_cmd (self):
         app.controller.stop_all()
+        self.request.sendall("OK\n")
+
+    def handle_pause_cmd (self):
+        app.controller.pause_all()
         self.request.sendall("OK\n")
 
     def handle_next_cmd (self):
@@ -230,9 +293,9 @@ class NetworkServer(SocketServer.BaseRequestHandler):
 
     def handle_playlist_cmd (self):
         i=0
-        while i < len(app.controller.playlist):
-            song = app.controller.playlist[i]
-            self.request.sendall("%s:%s\n" % (i,  song['file']))
+        while i < len(app.controller.state.playlist):
+            song = app.controller.state.playlist[i]
+            self.request.sendall("%d:%s\n" % (i,  song['file']))
             i += 1
         self.request.sendall("OK\n")
 
@@ -247,7 +310,9 @@ class NetworkServer(SocketServer.BaseRequestHandler):
 
         self.commands = {
             'add':      lambda args: self.handle_add_cmd(args),
+            'play':     lambda args: self.handle_play_cmd(),
             'stop':     lambda args: self.handle_stop_cmd(),
+            'pause':    lambda args: self.handle_pause_cmd(),
             'next':     lambda args: self.handle_next_cmd(),
             'quit':     lambda args: self.handle_quit_cmd(),
             'playlist': lambda args: self.handle_playlist_cmd(),
@@ -307,22 +372,13 @@ class Controller:
 
     def __init__(self):
 
-        self.playlist = [
-            { 'file': "/data/Media/mp3/Top40/2009/Van Velzen - On My Way.mp3", 'seek': 0 },
-            { 'file': "/data/Media/mp3/Top40/2010/Adam Lambert - Whataya Want From Me.mp3", 'seek': 0 },
-            { 'file': "/data/Media/mp3/Top40/2009/Stereo - Last Forever.mp3", 'seek': 0 },
-            { 'file': "/data/Media/mp3/Top40/2010/Jacqueline - Big World.mp3", 'seek': 3 },
-            { 'file': "/data/Media/mp3/Top40/2011/De Jeugd Van Tegenwoordig - Get Spanish.mp3", 'seek': 2.5 },
-            { 'file': "/data/Media/mp3/Top40/2011/Avril Lavigne - What The Hell.mp3", 'seek': 0 },
-            { 'file': "/data/Media/mp3/Top40/2011/Within Temptation - Faster.mp3", 'seek': 0 },
-            { 'file': "/data/Media/mp3/Top40/2011/Miss Montreal - Wish I Could.mp3", 'seek': 0 }
-        ]
+        self.state = Statekeeper()
 
         self.players     = []
         self.cued        = []
         self.last_song   = False
         self.in_mix      = False
-        self.lastcued    = -1
+        self.active      = False  # The currently active player
 
         app.logger.info ("Creating players")
         self.player1 = Player("player1")
@@ -331,6 +387,16 @@ class Controller:
 
         app.logger.debug ("End init")
 
+    def update_meta (self, song_index, discoverer):
+        secs = int(discoverer.audiolength / 1000000000)
+        self.state.playlist[song_index]['duration'] = secs
+        app.logger.debug (pprint.pformat(discoverer.tags))
+        if 'artist' in discoverer.tags:
+            self.state.playlist[song_index]['artist'] = discoverer.tags['artist']
+        if 'title' in discoverer.tags:
+            self.state.playlist[song_index]['title'] = discoverer.tags['title']
+        self.state.write_to_file()
+
     def get_free_player (self):
         for plname in self.players.iterkeys():
             pl = self.players[plname]
@@ -338,26 +404,37 @@ class Controller:
                 return pl
         return False
 
-    def cue_next (self, start_on_cue=False):
+    def cue (self, songindex, start_on_cue=False):
         try:
             pl = self.get_free_player()
-        except Exception:
-            app.logger.error ("Get_free_player exception")
+        except Exception, err:
+            app.logger.error ("Get_free_player exception (%s)" % err)
 
         if pl:
             pl.loaded = True
-            app.logger.info ("Going to load %s" % pl.name)
+            app.logger.info ("Going to load %s with song index %d" % (pl.name, songindex))
             try:
-                #song = self.playlist.pop(0)
-                self.lastcued += 1
-                song = self.playlist [self.lastcued]
-                pl.load(song, start_on_cue)
+                song = self.state.playlist[songindex]
+                app.logger.debug ("Going to load %s" % song['file'])
+                pl.load(song, start_on_cue, self.state.lastcued)
                 if not start_on_cue:
                     self.cued.append(pl)
+                self.state.lastcued = songindex
 
-            except:
-                app.logger.info ("No more songs")
+            except Exception, err:
+                app.logger.info ("No more songs (%s)" % err)
                 self.last_song = True
+                pl.loaded = False
+
+        else:
+            app.logger.debug ("No free player")
+
+    def cue_first (self):
+        self.cue (self.state.current_song, True)
+
+    def cue_next2 (self):
+        i = self.state.lastcued + 1
+        self.cue (i)
 
     def on_message(self, sender, bus, message):
         t = message.type
@@ -366,7 +443,7 @@ class Controller:
 
         if t == gst.MESSAGE_EOS:
             self.in_mix = False
-            self.cue_next ()
+            self.cue_next2 ()
 
         elif s == self.player1.level or s == self.player2.level:
 
@@ -418,9 +495,9 @@ class Controller:
 
     def start(self):
         # Load player1 and start playing
-        self.cue_next(True)
+        self.cue_first()
         # Load player2
-        self.cue_next()
+        self.cue_next2()
         self.playmode = True
 
         while self.playmode:
@@ -436,7 +513,7 @@ class Controller:
         try:
             nextplayer = self.cued.pop(0)
             nextplayer.play()
-            self.cue_next()
+            self.cue_next2()
         except:
             print "Nothing cued"
             self.last_song = True
@@ -445,22 +522,48 @@ class Controller:
         for pl in self.players_playing():
             pl.stop()
 
+    def play (self):
+        if self.players_playing() == []:
+            self.cue_first()
+            if self.active:
+                self.active.play()
+            else:
+                nextplayer = self.cued.pop(0)
+                nextplayer.play()
+
+    def pause_all (self):
+        for pl in self.players_playing():
+            pl.pause()
+
 class App:
 
     def __init__(self):
         self.server_addr  = "/var/run/mpdrip/mpdrip.sock"
         self.logfile      = "/var/log/mpdrip/mpdrip.log"
+        self.statefile    = "/var/lib/mpdrip/mpdrip.txt"
         self.listenip     = "127.0.0.1"
         self.listenport   = 6600
         self.level        = logging.INFO
+        self.daemonize    = True
 
     def setup_logging(self):
         self.logger = logging.getLogger('app')
         self.logger.setLevel(self.level)
         formatter = logging.Formatter('%(asctime)s [%(process)d] %(levelname)s: %(message)s','%Y-%m-%d %H:%M:%S')
-        self.loghandler = logging.handlers.WatchedFileHandler(self.logfile)
-        self.loghandler.setFormatter(formatter)
-        self.logger.addHandler(self.loghandler)
+        loghandler = logging.handlers.WatchedFileHandler(self.logfile)
+        loghandler.setFormatter(formatter)
+        self.logger.addHandler(loghandler)
+
+        if self.daemonize == True:
+           # Redirect stdout and stderr to logger, using StreamToLogger object that handles writes
+            sys.stdout = StreamToLogger(self.logger, logging.INFO)
+            sys.stderr = StreamToLogger(self.logger, logging.ERROR)
+
+        else:
+            # Set up a second loghandler, that writes to stderr
+            loghandler2 = logging.StreamHandler(sys.stderr)
+            loghandler2.setFormatter(formatter)
+            self.logger.addHandler(loghandler2)
 
         self.logger.info("Current configuration:")
         self.logger.info("- socket         : %s" % self.server_addr)
@@ -477,12 +580,13 @@ class App:
         print "                               (default: %s)" % self.logfile
         print "     --loglevel <level>        the loglevel; valid levels are <debug|info|warning|error|critical>"
         print " -v, --verbose                 equivalent to '--loglevel debug'"
+        print " -D                            do not daemonize, keep running in the foreground"
         print ""
         sys.exit(2)
 
     def process_options(self):
         try:
-            opts, _args = getopt.getopt(sys.argv[1:], "hs:l:v", ["help", "socket=", "logfile=", "loglevel=", "verbose"])
+            opts, _args = getopt.getopt(sys.argv[1:], "hDs:l:S:v", ["help", "socket=", "logfile=", "loglevel=", "statefile=", "verbose"])
         except getopt.GetoptError, err:
             # print help information and exit:
             print str(err) # will print something like "option -x not recognized"
@@ -496,6 +600,8 @@ class App:
                 self.server_addr = arg
             elif opt in ("-l", "--logfile"):
                 self.logfile = arg
+            elif opt in ("-S", "--statefile"):
+                self.statefile = arg
             elif opt in ("--loglevel"):
                 self.level = getattr(logging, arg.upper(), None)
                 if self.level is None:
@@ -503,9 +609,12 @@ class App:
                     self.usage()
             elif opt in ("-v", "--verbose"):
                 self.level = logging.DEBUG
+            elif opt in ("-D"):
+                self.daemonize = False
 
     def main(self):
         #thread.start_new_thread(controller.start, ())
+        self.setup_logging()
 
         try:
             # Set up controller thread
@@ -532,10 +641,6 @@ class App:
             self.tcpserver_thread.start()
             self.logger.debug("Server loop running in thread: %s" % self.tcpserver_thread.name)
 
-            # Redirect stdout and stderr to logger, using StreamToLogger object that handles writes
-            sys.stdout = StreamToLogger(self.logger, logging.INFO)
-            sys.stderr = StreamToLogger(self.logger, logging.ERROR)
-
             # Start main loop
             gobject.threads_init()
             self.loop = glib.MainLoop()
@@ -552,16 +657,18 @@ if __name__ == "__main__":
 
     app = App()
     app.process_options()
-    app.setup_logging()
 
-    context = daemon.DaemonContext(
-        files_preserve=[app.loghandler.stream]
-    )
-    context.signal_map = {
-        signal.SIGTERM: handle_signal,
-        signal.SIGINT: handle_signal,
-        signal.SIGUSR1: handle_signal
-    }
+    if app.daemonize == True:
+        context = daemon.DaemonContext()
+        context.signal_map = {
+            signal.SIGTERM: handle_signal,
+            signal.SIGINT: handle_signal,
+            signal.SIGUSR1: handle_signal
+        }
 
-    with context:
+        with context:
+            app.main()
+
+    else:
+        signal.signal (signal.SIGINT, handle_signal)
         app.main()

@@ -72,7 +72,8 @@ def handle_signal (sig, _frame):
         app.logger.debug ("Writing state file")
         app.controller.state.write_to_file()
         app.logger.warning ("Exiting...")
-        app.logger.debug ("Shutting down server")
+        app.controller.playmode = False
+        app.logger.debug ("Shutting down servers")
         app.server.shutdown()
         app.tcpserver.shutdown()
         app.logger.info ("Removing socket file")
@@ -107,14 +108,21 @@ class ThreadedTCPServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
 
 class Statekeeper:
 
-    playlist = []
-    lastcued = -1
-    current_song = 0
-    position = 0
-    volume = 0.9
-
     def __init__(self):
         self.read_from_file()
+        self.playlistlength = len(self.playlist)
+        if not hasattr (self, 'playlist'):
+            self.playlist = []
+        if not hasattr (self, 'current_song'):
+            self.current_song = 0
+        if not hasattr (self, 'lastcued'):
+            self.lastcued = -1
+        if not hasattr (self, 'volume'):
+            self.volume = 0.9
+        if not hasattr (self, 'state'):
+            self.state = "stop"
+        if not hasattr (self, 'position'):
+            self.position = 0
 
     def read_from_file (self):
         if os.path.exists (app.statefile):
@@ -139,7 +147,7 @@ class Statekeeper:
         app.logger.debug ("Lock on state file (%s) acquired" % app.statefile)
         try:
             fp = open (app.statefile, 'w')
-            json.dump (self.__dict__, fp)
+            json.dump (self.__dict__, fp, indent=2)
             fp.close()
         except IOError, err:
             app.logger.error("Could not write state file (%s)" % err)
@@ -240,8 +248,6 @@ class Player:
         self.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, seek_ns)
 
     def play (self):
-        #seek_ns = self.beginoff * 1000000000
-        #self.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, seek_ns)
         app.logger.debug ("Setting %s to PLAYING" % self.name)
         self.pipeline.set_state(gst.STATE_PLAYING)
         app.controller.active = self
@@ -270,8 +276,8 @@ class NetworkServer(SocketServer.BaseRequestHandler):
             else:
                 self.request.sendall("File does not exist\n")
 
-    def handle_play_cmd (self):
-        app.controller.play()
+    def handle_play_cmd (self, args):
+        app.controller.play(args)
         self.request.sendall("OK\n")
 
     def handle_stop_cmd (self):
@@ -304,19 +310,25 @@ class NetworkServer(SocketServer.BaseRequestHandler):
         self.request.close()
         handle_signal (signal.SIGTERM, True)
 
+    def handle_status_cmd (self):
+        for k in ['playlistlength','state','current_song','volume']:
+            self.request.sendall("%s: %s\n" % (k, app.controller.state.__dict__[k]))
+        self.request.sendall("OK\n")
+
     def handle (self):
 
         # self.request is a socket object
 
         self.commands = {
             'add':      lambda args: self.handle_add_cmd(args),
-            'play':     lambda args: self.handle_play_cmd(),
+            'play':     lambda args: self.handle_play_cmd(args),
             'stop':     lambda args: self.handle_stop_cmd(),
             'pause':    lambda args: self.handle_pause_cmd(),
             'next':     lambda args: self.handle_next_cmd(),
             'quit':     lambda args: self.handle_quit_cmd(),
             'playlist': lambda args: self.handle_playlist_cmd(),
-            'kill':     lambda args: self.handle_kill_cmd()
+            'kill':     lambda args: self.handle_kill_cmd(),
+            'status':   lambda args: self.handle_status_cmd()
         }
 
         try:
@@ -522,7 +534,12 @@ class Controller:
         for pl in self.players_playing():
             pl.stop()
 
-    def play (self):
+    def play (self, args):
+        argstr = " ".join (args)
+        if (argstr != ""):
+            self.stop_all()
+            self.state.current_song = int(argstr)
+
         if self.players_playing() == []:
             self.cue_first()
             if self.active:
@@ -534,6 +551,7 @@ class Controller:
     def pause_all (self):
         for pl in self.players_playing():
             pl.pause()
+        self.state.state = "pause"
 
 class App:
 

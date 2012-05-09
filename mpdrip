@@ -100,9 +100,11 @@ class StreamToLogger(object):
             self.logger.log(self.log_level, line.rstrip())
 
 class ThreadedUnixStreamServer(SocketServer.ThreadingMixIn, SocketServer.UnixStreamServer):
+    daemon_threads = True
     pass
 
 class ThreadedTCPServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
+    daemon_threads = True
     allow_reuse_address = True
     pass
 
@@ -110,6 +112,8 @@ class Statekeeper:
 
     def __init__(self):
         self.read_from_file()
+        if not hasattr (self, 'playlist'):
+            self.playlist = []
         self.playlistlength = len(self.playlist)
         if not hasattr (self, 'playlist'):
             self.playlist = []
@@ -219,27 +223,14 @@ class Player:
             app.logger.info ("Loading file %s" % song['file'])
             self.pipeline.set_state(gst.STATE_READY)
             self.source.set_property("location", song['file'])
-            self.discoverer = Discoverer(song['file'])
-            self.discoverer.connect('discovered', self._discovered)
-            self.discoverer.discover()
             if start_on_cue:
                 self.start_on_cue = True
-        else:
-            app.logger.warning ("File does not exist! %s" % song['file'])
-            self.loaded = False
-
-    def _discovered (self, discoverer, ismedia):
-            secs = int(discoverer.audiolength / 1000000000)
-            app.logger.info ("Discovered: %s last %s seconds" % (self.song['file'], secs))
-            self.duration = secs
-            app.controller.update_meta(self.song_index, discoverer)
-            try:
-                self.beginoff = self.song['seek']
-            except KeyError:
-                self.beginoff = 0
             app.logger.debug ("Setting %s to PAUSED" % self.name)
             self.pipeline.set_state(gst.STATE_PAUSED)
             self.loaded = True
+        else:
+            app.logger.warning ("File does not exist! %s" % song['file'])
+            self.loaded = False
 
     def seek (self, time):
         app.logger.debug ("player %s seeking %s seconds" % ( self.name, time ))
@@ -268,13 +259,10 @@ class NetworkServer(SocketServer.BaseRequestHandler):
 
     def handle_add_cmd (self, args):
         for filename in args:
-            if os.path.exists(filename):
-                self.request.sendall("Adding " + filename + "\n")
-                app.controller.state.playlist.append({ 'file': filename})
-                app.controller.state.write_to_file()
-                app.controller.cue_next2()
+            if app.controller.add_to_playlist(filename):
+                self.request.sendall("Added " + filename + "\n")
             else:
-                self.request.sendall("File does not exist\n")
+                self.request.sendall("Not added '%s'. Does file exits?\n" % filename)
 
     def handle_play_cmd (self, args):
         app.controller.play(args)
@@ -399,10 +387,50 @@ class Controller:
 
         app.logger.debug ("End init")
 
+    def start(self):
+        # Load player1 and start playing
+        self.cue_first()
+        # Load player2
+        self.cue_next()
+        self.playmode = True
+
+        while self.playmode:
+            if self.last_song and self.cued == [] and self.players_playing == []:
+                self.playmode = False
+            time.sleep(1)
+
+        #time.sleep(1)
+        app.loop.quit()
+
+    def add_to_playlist(self, filename):
+        if os.path.exists(filename):
+            self.state.playlist.append({ 'file': filename})
+            song_index = len(self.state.playlist) - 1
+            self.state.write_to_file()
+            self.cue_next()
+            self.discoverer = Discoverer(filename)
+            # Use the discoverer object to pass some values to the callback function
+            self.discoverer.filename = filename
+            self.discoverer.song_index = song_index
+            self.discoverer.connect('discovered', self._discovered)
+            self.discoverer.discover()
+            return True
+        else:
+            return False
+
+    def _discovered (self, discoverer, ismedia):
+        secs = int(discoverer.audiolength / 1000000000)
+        app.logger.info ("Discovered: %s last %s seconds" % (discoverer.filename, secs))
+        self.duration = secs
+        self.update_meta(discoverer.song_index, discoverer)
+        self.cue_next()
+
     def update_meta (self, song_index, discoverer):
         secs = int(discoverer.audiolength / 1000000000)
         self.state.playlist[song_index]['duration'] = secs
         app.logger.debug (pprint.pformat(discoverer.tags))
+        info = os.stat(discoverer.filename)
+        self.state.playlist[song_index]['discovered_mtime'] = info.st_mtime
         if 'artist' in discoverer.tags:
             self.state.playlist[song_index]['artist'] = discoverer.tags['artist']
         if 'title' in discoverer.tags:
@@ -444,7 +472,7 @@ class Controller:
     def cue_first (self):
         self.cue (self.state.current_song, True)
 
-    def cue_next2 (self):
+    def cue_next (self):
         i = self.state.lastcued + 1
         self.cue (i)
 
@@ -455,7 +483,7 @@ class Controller:
 
         if t == gst.MESSAGE_EOS:
             self.in_mix = False
-            self.cue_next2 ()
+            self.cue_next ()
 
         elif s == self.player1.level or s == self.player2.level:
 
@@ -505,27 +533,12 @@ class Controller:
                 pp.append(pl)
         return pp
 
-    def start(self):
-        # Load player1 and start playing
-        self.cue_first()
-        # Load player2
-        self.cue_next2()
-        self.playmode = True
-
-        while self.playmode:
-            if self.last_song and self.cued == [] and self.players_playing == []:
-                self.playmode = False
-            time.sleep(1)
-
-        #time.sleep(1)
-        app.loop.quit()
-
     def next (self):
         self.stop_all()
         try:
             nextplayer = self.cued.pop(0)
             nextplayer.play()
-            self.cue_next2()
+            self.cue_next()
         except:
             print "Nothing cued"
             self.last_song = True
@@ -632,6 +645,7 @@ class App:
 
     def main(self):
         #thread.start_new_thread(controller.start, ())
+        os.stat_float_times(False)
         self.setup_logging()
 
         try:
@@ -639,7 +653,6 @@ class App:
             self.logger.info("Starting controller thread")
             self.controller = Controller()
             self.controller_thread = threading.Thread(target=self.controller.start)
-            self.controller_thread.daemon = True
             self.controller_thread.start()
             self.logger.debug("Controller loop running in thread: %s" % self.controller_thread.name)
 
@@ -647,7 +660,6 @@ class App:
             self.logger.info("Starting network server on %s" % self.server_addr)
             self.server = ThreadedUnixStreamServer(self.server_addr, NetworkServer)
             self.server_thread = threading.Thread(target=self.server.serve_forever)
-            self.server_thread.daemon = True
             self.server_thread.start()
             self.logger.debug("Server loop running in thread: %s" % self.server_thread.name)
 
@@ -655,7 +667,6 @@ class App:
             self.logger.info("Starting TCP server on %s:%d" % (self.listenip, self.listenport))
             self.tcpserver = ThreadedTCPServer((self.listenip, self.listenport), NetworkServer)
             self.tcpserver_thread = threading.Thread(target=self.tcpserver.serve_forever)
-            self.tcpserver_thread.daemon = True
             self.tcpserver_thread.start()
             self.logger.debug("Server loop running in thread: %s" % self.tcpserver_thread.name)
 
@@ -669,7 +680,8 @@ class App:
 
         except IOError, err:
             self.logger.error('IO Error: %s' % err)
-            self.server.shutdown()
+            if hasattr(self, 'server'):
+                self.server.shutdown()
 
 if __name__ == "__main__":
 

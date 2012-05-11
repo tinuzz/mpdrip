@@ -162,13 +162,14 @@ class Player:
     def __init__(self, name):
 
         # Init state
-        self.name          = name
-        self.loaded        = False
-        self.start_on_cue  = False
-        self.song_index    = False
-        self.duration      = 0
-        self.beginoff      = 0
-        self.song          = {}
+        self.name            = name
+        self.loaded          = False
+        self.song_index      = False
+        self.duration        = 0
+        self.beginoff        = 0
+        self.song            = {}
+        self.ready           = False
+        self.play_if_ready   = False
 
         # Create pipeline
         self.pipeline = gst.Pipeline(name)
@@ -197,10 +198,10 @@ class Player:
         name = pipeline.get_name()
         convert = pipeline.get_by_name('convert')
         decode.link(convert)
-        print "Player class: %s linked!" % self.name
-        if self.start_on_cue:
+        app.logger.debug("Player class: %s linked!" % self.name)
+        if self.play_if_ready:
+            app.logger.debug("Player %s is ready. Calling play()." % self.name)
             self.play()
-            self.start_on_cue = False
 
     def on_message(self, bus, message):
         #app.logger.debug ("Entering %s::on_message()" % self.__class__.__name__)
@@ -209,13 +210,11 @@ class Player:
         sname = message.src.get_name()
 
         if t == gst.MESSAGE_EOS:
-            print "Stopping %s" % self.name
-            self.pipeline.set_state(gst.STATE_NULL)
-            self.loaded = False
+            self.stop()
 
         app.controller.on_message(self, bus, message)
 
-    def load (self, song, start_on_cue, song_index):
+    def load (self, song, song_index):
         app.logger.debug ("Entering %s::load()" % self.__class__.__name__)
         if os.path.exists(song['file']):
             self.song_index = song_index
@@ -223,8 +222,6 @@ class Player:
             app.logger.info ("Loading file %s" % song['file'])
             self.pipeline.set_state(gst.STATE_READY)
             self.source.set_property("location", song['file'])
-            if start_on_cue:
-                self.start_on_cue = True
             app.logger.debug ("Setting %s to PAUSED" % self.name)
             self.pipeline.set_state(gst.STATE_PAUSED)
             self.loaded = True
@@ -243,15 +240,26 @@ class Player:
         self.pipeline.set_state(gst.STATE_PLAYING)
         app.controller.active = self
         app.controller.state.current_song = self.song_index
+        self.play_if_ready = False
 
     def stop (self):
         app.logger.debug ("Setting %s to NULL (stopping)" % self.name)
         self.pipeline.set_state(gst.STATE_NULL)
         self.loaded = False
+        self.ready = False
+        self.play_if_ready = False
 
     def pause (self):
         app.logger.debug ("Setting %s to PAUSED" % self.name)
         self.pipeline.set_state(gst.STATE_PAUSED)
+
+    def play_when_ready(self):
+        if self.ready:
+            app.logger.debug("Player %s is ready, calling play()" % self.name)
+            self.play()
+        else:
+            app.logger.debug("Player %s is not ready, deferring play()" % self.name)
+            self.play_if_ready = True
 
 class NetworkServer(SocketServer.BaseRequestHandler):
 
@@ -278,6 +286,10 @@ class NetworkServer(SocketServer.BaseRequestHandler):
 
     def handle_next_cmd (self):
         app.controller.next()
+        self.request.sendall("OK\n")
+
+    def handle_seek_cmd (self, args):
+        app.controller.seek(args)
         self.request.sendall("OK\n")
 
     def handle_quit_cmd (self):
@@ -313,6 +325,7 @@ class NetworkServer(SocketServer.BaseRequestHandler):
             'stop':     lambda args: self.handle_stop_cmd(),
             'pause':    lambda args: self.handle_pause_cmd(),
             'next':     lambda args: self.handle_next_cmd(),
+            'seek':     lambda args: self.handle_seek_cmd(args),
             'quit':     lambda args: self.handle_quit_cmd(),
             'playlist': lambda args: self.handle_playlist_cmd(),
             'kill':     lambda args: self.handle_kill_cmd(),
@@ -376,9 +389,9 @@ class Controller:
 
         self.players     = []
         self.cued        = []
-        self.last_song   = False
         self.in_mix      = False
         self.active      = False  # The currently active player
+        self.have_logged = False  # Used to cut down the number of log messages
 
         app.logger.info ("Creating players")
         self.player1 = Player("player1")
@@ -395,8 +408,6 @@ class Controller:
         self.playmode = True
 
         while self.playmode:
-            if self.last_song and self.cued == [] and self.players_playing == []:
-                self.playmode = False
             time.sleep(1)
 
         #time.sleep(1)
@@ -444,30 +455,42 @@ class Controller:
                 return pl
         return False
 
-    def cue (self, songindex, start_on_cue=False):
+    def cue (self, songindex, play_when_ready=False):
+        song = False
         try:
-            pl = self.get_free_player()
-        except Exception, err:
-            app.logger.error ("Get_free_player exception (%s)" % err)
+            song = self.state.playlist[songindex]
+        except IndexError:
+            app.logger.info("Song %d not available, playlist has %d items" % (songindex, len(self.state.playlist)))
 
-        if pl:
-            pl.loaded = True
-            app.logger.info ("Going to load %s with song index %d" % (pl.name, songindex))
+        if song:
+            pl = False
             try:
-                song = self.state.playlist[songindex]
-                app.logger.debug ("Going to load %s" % song['file'])
-                pl.load(song, start_on_cue, self.state.lastcued)
-                if not start_on_cue:
-                    self.cued.append(pl)
-                self.state.lastcued = songindex
-
+                pl = self.get_free_player()
             except Exception, err:
-                app.logger.info ("No more songs (%s)" % err)
-                self.last_song = True
-                pl.loaded = False
+                app.logger.error ("Get_free_player exception (%s)" % err)
 
-        else:
-            app.logger.debug ("No free player")
+            if pl:
+                pl.loaded = True
+                app.logger.info ("Going to load %s with '%s' (song index %d)" % (pl.name, song['file'], songindex))
+                #app.logger.debug(pprint.pformat(pl))
+                try:
+                    app.logger.debug("Calling pl.load()")
+                    pl.load(song, self.state.lastcued)
+                    app.logger.debug("Calling self.cued.append()")
+                    self.cued.append(pl)
+                    app.logger.debug("Setting self.state.lastcued")
+                    self.state.lastcued = songindex
+                    if play_when_ready:
+                        app.logger.debug("Calling pl.play_when_ready()")
+                        pl.play_when_ready()
+
+                except Exception, err:
+                    app.logger.info ("No more songs (%s)" % err)
+                    #self.last_song = True
+                    pl.loaded = False
+
+            else:
+                app.logger.debug ("No free player")
 
     def cue_first (self):
         self.cue (self.state.current_song, True)
@@ -505,8 +528,13 @@ class Controller:
                 pos0 = s.query_position(gst.FORMAT_TIME)[0]
                 pos1 = pos0 / 1000000000.0
                 player = pipeline.get_name()
-                dur = self.players[player].duration
-                #app.logger.debug ("Position: %s, duration: %s, Level: %s" % (pos1,dur,rmsdb))
+                dur = self.players[player].song['duration']
+                pos1int = int(pos1)
+                if pos1int % 10 == 0 and self.have_logged == False:
+                    app.logger.debug ("Position: %s, duration: %s, Level: %s" % (pos1,dur,rmsdb))
+                    self.have_logged = True
+                if pos1int % 10 != 0:
+                    self.have_logged = False
 
                 #if pos1 > 10 and pos1 < 11:
                 #    #seek_ns = pos0 + (150 * 1000000000)
@@ -515,10 +543,14 @@ class Controller:
 
                 time_left = dur - pos1
 
-                if time_left < 15 and rmsdb < -28 and not self.last_song and not self.in_mix:
-                    self.in_mix = True
-                    nextplayer = self.cued.pop(0)
-                    nextplayer.play()
+                if time_left < 15 and rmsdb < -28 and not self.in_mix:
+                    try:
+                        nextplayer = self.cued.pop(0)
+                        nextplayer.play()
+                        self.in_mix = True
+                    except Exception:
+                        print "Nothing cued"
+                        #self.last_song = True
 
 #
 #        #else:
@@ -539,9 +571,9 @@ class Controller:
             nextplayer = self.cued.pop(0)
             nextplayer.play()
             self.cue_next()
-        except:
+        except Exception:
             print "Nothing cued"
-            self.last_song = True
+            #self.last_song = True
 
     def stop_all (self):
         for pl in self.players_playing():
@@ -566,6 +598,11 @@ class Controller:
             pl.pause()
         self.state.state = "pause"
 
+    def seek (self, args):
+        pos = int(args[0])
+        pos_ns = pos * 1000000000
+        self.active.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, pos_ns)
+
 class App:
 
     def __init__(self):
@@ -580,7 +617,7 @@ class App:
     def setup_logging(self):
         self.logger = logging.getLogger('app')
         self.logger.setLevel(self.level)
-        formatter = logging.Formatter('%(asctime)s [%(process)d] %(levelname)s: %(message)s','%Y-%m-%d %H:%M:%S')
+        formatter = logging.Formatter('%(asctime)s [%(process)d] %(levelname)s: %(message)s (line %(lineno)d)','%Y-%m-%d %H:%M:%S')
         loghandler = logging.handlers.WatchedFileHandler(self.logfile)
         loghandler.setFormatter(formatter)
         self.logger.addHandler(loghandler)

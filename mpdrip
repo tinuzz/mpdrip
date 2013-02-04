@@ -72,8 +72,7 @@ def handle_signal (sig, _frame):
         app.logger.debug ("Writing state file")
         app.controller.state.write_to_file()
         app.logger.warning ("Exiting...")
-        app.controller.playmode = False
-        app.logger.debug ("Shutting down servers")
+        app.logger.debug ("Shutting down server")
         app.server.shutdown()
         app.tcpserver.shutdown()
         app.logger.info ("Removing socket file")
@@ -100,33 +99,22 @@ class StreamToLogger(object):
             self.logger.log(self.log_level, line.rstrip())
 
 class ThreadedUnixStreamServer(SocketServer.ThreadingMixIn, SocketServer.UnixStreamServer):
-    daemon_threads = True
     pass
 
 class ThreadedTCPServer(SocketServer.ThreadingMixIn, SocketServer.TCPServer):
-    daemon_threads = True
     allow_reuse_address = True
     pass
 
 class Statekeeper:
 
+    playlist = []
+    lastcued = -1
+    current_song = 0
+    position = 0
+    volume = 0.9
+
     def __init__(self):
         self.read_from_file()
-        if not hasattr (self, 'playlist'):
-            self.playlist = []
-        self.playlistlength = len(self.playlist)
-        if not hasattr (self, 'playlist'):
-            self.playlist = []
-        if not hasattr (self, 'current_song'):
-            self.current_song = 0
-        if not hasattr (self, 'lastcued'):
-            self.lastcued = -1
-        if not hasattr (self, 'volume'):
-            self.volume = 0.9
-        if not hasattr (self, 'state'):
-            self.state = "stop"
-        if not hasattr (self, 'position'):
-            self.position = 0
 
     def read_from_file (self):
         if os.path.exists (app.statefile):
@@ -134,12 +122,13 @@ class Statekeeper:
             try:
                 fp = open (app.statefile, 'r')
                 try:
+                    app.logger.debug("Before state: %s" % pprint.pformat (self.__dict__))
                     state = json.load (fp)
                     self.__dict__ = state
                 except ValueError, err:
                     app.logger.info(err)
 
-                app.logger.debug("State: %s" % pprint.pformat (self.__dict__))
+                app.logger.debug("After state: %s" % pprint.pformat (self.__dict__))
                 fp.close()
             except IOError, err:
                 app.logger.error("Could not read state file (%s)" % err)
@@ -151,7 +140,7 @@ class Statekeeper:
         app.logger.debug ("Lock on state file (%s) acquired" % app.statefile)
         try:
             fp = open (app.statefile, 'w')
-            json.dump (self.__dict__, fp, indent=2)
+            json.dump (self.__dict__, fp)
             fp.close()
         except IOError, err:
             app.logger.error("Could not write state file (%s)" % err)
@@ -162,14 +151,13 @@ class Player:
     def __init__(self, name):
 
         # Init state
-        self.name            = name
-        self.loaded          = False
-        self.song_index      = False
-        self.duration        = 0
-        self.beginoff        = 0
-        self.song            = {}
-        self.ready           = False
-        self.play_if_ready   = False
+        self.name          = name
+        self.loaded        = False
+        self.start_on_cue  = False
+        self.song_index    = False
+        self.duration      = 0
+        self.beginoff      = 0
+        self.song          = {}
 
         # Create pipeline
         self.pipeline = gst.Pipeline(name)
@@ -198,10 +186,10 @@ class Player:
         name = pipeline.get_name()
         convert = pipeline.get_by_name('convert')
         decode.link(convert)
-        app.logger.debug("Player class: %s linked!" % self.name)
-        if self.play_if_ready:
-            app.logger.debug("Player %s is ready. Calling play()." % self.name)
+        print "Player class: %s linked!" % self.name
+        if self.start_on_cue:
             self.play()
+            self.start_on_cue = False
 
     def on_message(self, bus, message):
         #app.logger.debug ("Entering %s::on_message()" % self.__class__.__name__)
@@ -210,11 +198,13 @@ class Player:
         sname = message.src.get_name()
 
         if t == gst.MESSAGE_EOS:
-            self.stop()
+            print "Stopping %s" % self.name
+            self.pipeline.set_state(gst.STATE_NULL)
+            self.loaded = False
 
         app.controller.on_message(self, bus, message)
 
-    def load (self, song, song_index):
+    def load (self, song, start_on_cue, song_index):
         app.logger.debug ("Entering %s::load()" % self.__class__.__name__)
         if os.path.exists(song['file']):
             self.song_index = song_index
@@ -222,12 +212,27 @@ class Player:
             app.logger.info ("Loading file %s" % song['file'])
             self.pipeline.set_state(gst.STATE_READY)
             self.source.set_property("location", song['file'])
-            app.logger.debug ("Setting %s to PAUSED" % self.name)
-            self.pipeline.set_state(gst.STATE_PAUSED)
-            self.loaded = True
+            self.discoverer = Discoverer(song['file'])
+            self.discoverer.connect('discovered', self._discovered)
+            self.discoverer.discover()
+            if start_on_cue:
+                self.start_on_cue = True
         else:
             app.logger.warning ("File does not exist! %s" % song['file'])
             self.loaded = False
+
+    def _discovered (self, discoverer, ismedia):
+            secs = int(discoverer.audiolength / 1000000000)
+            app.logger.info ("Discovered: %s last %s seconds" % (self.song['file'], secs))
+            self.duration = secs
+            app.controller.update_meta(self.song_index, discoverer)
+            try:
+                self.beginoff = self.song['seek']
+            except KeyError:
+                self.beginoff = 0
+            app.logger.debug ("Setting %s to PAUSED" % self.name)
+            self.pipeline.set_state(gst.STATE_PAUSED)
+            self.loaded = True
 
     def seek (self, time):
         app.logger.debug ("player %s seeking %s seconds" % ( self.name, time ))
@@ -236,30 +241,21 @@ class Player:
         self.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, seek_ns)
 
     def play (self):
+        #seek_ns = self.beginoff * 1000000000
+        #self.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, seek_ns)
         app.logger.debug ("Setting %s to PLAYING" % self.name)
         self.pipeline.set_state(gst.STATE_PLAYING)
         app.controller.active = self
         app.controller.state.current_song = self.song_index
-        self.play_if_ready = False
 
     def stop (self):
         app.logger.debug ("Setting %s to NULL (stopping)" % self.name)
         self.pipeline.set_state(gst.STATE_NULL)
         self.loaded = False
-        self.ready = False
-        self.play_if_ready = False
 
     def pause (self):
         app.logger.debug ("Setting %s to PAUSED" % self.name)
         self.pipeline.set_state(gst.STATE_PAUSED)
-
-    def play_when_ready(self):
-        if self.ready:
-            app.logger.debug("Player %s is ready, calling play()" % self.name)
-            self.play()
-        else:
-            app.logger.debug("Player %s is not ready, deferring play()" % self.name)
-            self.play_if_ready = True
 
 class NetworkServer(SocketServer.BaseRequestHandler):
 
@@ -267,13 +263,16 @@ class NetworkServer(SocketServer.BaseRequestHandler):
 
     def handle_add_cmd (self, args):
         for filename in args:
-            if app.controller.add_to_playlist(filename):
-                self.request.sendall("Added " + filename + "\n")
+            if os.path.exists(filename):
+                self.request.sendall("Adding " + filename + "\n")
+                app.controller.state.playlist.append({ 'file': filename})
+                app.controller.state.write_to_file()
+                app.controller.cue_next2()
             else:
-                self.request.sendall("Not added '%s'. Does file exits?\n" % filename)
+                self.request.sendall("File does not exist\n")
 
-    def handle_play_cmd (self, args):
-        app.controller.play(args)
+    def handle_play_cmd (self):
+        app.controller.play()
         self.request.sendall("OK\n")
 
     def handle_stop_cmd (self):
@@ -286,10 +285,6 @@ class NetworkServer(SocketServer.BaseRequestHandler):
 
     def handle_next_cmd (self):
         app.controller.next()
-        self.request.sendall("OK\n")
-
-    def handle_seek_cmd (self, args):
-        app.controller.seek(args)
         self.request.sendall("OK\n")
 
     def handle_quit_cmd (self):
@@ -310,26 +305,19 @@ class NetworkServer(SocketServer.BaseRequestHandler):
         self.request.close()
         handle_signal (signal.SIGTERM, True)
 
-    def handle_status_cmd (self):
-        for k in ['playlistlength','state','current_song','volume']:
-            self.request.sendall("%s: %s\n" % (k, app.controller.state.__dict__[k]))
-        self.request.sendall("OK\n")
-
     def handle (self):
 
         # self.request is a socket object
 
         self.commands = {
             'add':      lambda args: self.handle_add_cmd(args),
-            'play':     lambda args: self.handle_play_cmd(args),
+            'play':     lambda args: self.handle_play_cmd(),
             'stop':     lambda args: self.handle_stop_cmd(),
             'pause':    lambda args: self.handle_pause_cmd(),
             'next':     lambda args: self.handle_next_cmd(),
-            'seek':     lambda args: self.handle_seek_cmd(args),
             'quit':     lambda args: self.handle_quit_cmd(),
             'playlist': lambda args: self.handle_playlist_cmd(),
-            'kill':     lambda args: self.handle_kill_cmd(),
-            'status':   lambda args: self.handle_status_cmd()
+            'kill':     lambda args: self.handle_kill_cmd()
         }
 
         try:
@@ -389,9 +377,9 @@ class Controller:
 
         self.players     = []
         self.cued        = []
+        self.last_song   = False
         self.in_mix      = False
         self.active      = False  # The currently active player
-        self.have_logged = False  # Used to cut down the number of log messages
 
         app.logger.info ("Creating players")
         self.player1 = Player("player1")
@@ -400,48 +388,10 @@ class Controller:
 
         app.logger.debug ("End init")
 
-    def start(self):
-        # Load player1 and start playing
-        self.cue_first()
-        # Load player2
-        self.cue_next()
-        self.playmode = True
-
-        while self.playmode:
-            time.sleep(1)
-
-        #time.sleep(1)
-        app.loop.quit()
-
-    def add_to_playlist(self, filename):
-        if os.path.exists(filename):
-            self.state.playlist.append({ 'file': filename})
-            song_index = len(self.state.playlist) - 1
-            self.state.write_to_file()
-            self.cue_next()
-            self.discoverer = Discoverer(filename)
-            # Use the discoverer object to pass some values to the callback function
-            self.discoverer.filename = filename
-            self.discoverer.song_index = song_index
-            self.discoverer.connect('discovered', self._discovered)
-            self.discoverer.discover()
-            return True
-        else:
-            return False
-
-    def _discovered (self, discoverer, ismedia):
-        secs = int(discoverer.audiolength / 1000000000)
-        app.logger.info ("Discovered: %s last %s seconds" % (discoverer.filename, secs))
-        self.duration = secs
-        self.update_meta(discoverer.song_index, discoverer)
-        self.cue_next()
-
     def update_meta (self, song_index, discoverer):
         secs = int(discoverer.audiolength / 1000000000)
         self.state.playlist[song_index]['duration'] = secs
         app.logger.debug (pprint.pformat(discoverer.tags))
-        info = os.stat(discoverer.filename)
-        self.state.playlist[song_index]['discovered_mtime'] = info.st_mtime
         if 'artist' in discoverer.tags:
             self.state.playlist[song_index]['artist'] = discoverer.tags['artist']
         if 'title' in discoverer.tags:
@@ -455,47 +405,35 @@ class Controller:
                 return pl
         return False
 
-    def cue (self, songindex, play_when_ready=False):
-        song = False
+    def cue (self, songindex, start_on_cue=False):
         try:
-            song = self.state.playlist[songindex]
-        except IndexError:
-            app.logger.info("Song %d not available, playlist has %d items" % (songindex, len(self.state.playlist)))
+            pl = self.get_free_player()
+        except Exception, err:
+            app.logger.error ("Get_free_player exception (%s)" % err)
 
-        if song:
-            pl = False
+        if pl:
+            pl.loaded = True
+            app.logger.info ("Going to load %s with song index %d" % (pl.name, songindex))
             try:
-                pl = self.get_free_player()
-            except Exception, err:
-                app.logger.error ("Get_free_player exception (%s)" % err)
-
-            if pl:
-                pl.loaded = True
-                app.logger.info ("Going to load %s with '%s' (song index %d)" % (pl.name, song['file'], songindex))
-                #app.logger.debug(pprint.pformat(pl))
-                try:
-                    app.logger.debug("Calling pl.load()")
-                    pl.load(song, self.state.lastcued)
-                    app.logger.debug("Calling self.cued.append()")
+                song = self.state.playlist[songindex]
+                app.logger.debug ("Going to load %s" % song['file'])
+                pl.load(song, start_on_cue, self.state.lastcued)
+                if not start_on_cue:
                     self.cued.append(pl)
-                    app.logger.debug("Setting self.state.lastcued")
-                    self.state.lastcued = songindex
-                    if play_when_ready:
-                        app.logger.debug("Calling pl.play_when_ready()")
-                        pl.play_when_ready()
+                self.state.lastcued = songindex
 
-                except Exception, err:
-                    app.logger.info ("No more songs (%s)" % err)
-                    #self.last_song = True
-                    pl.loaded = False
+            except Exception, err:
+                app.logger.info ("No more songs (%s)" % err)
+                self.last_song = True
+                pl.loaded = False
 
-            else:
-                app.logger.debug ("No free player")
+        else:
+            app.logger.debug ("No free player")
 
     def cue_first (self):
         self.cue (self.state.current_song, True)
 
-    def cue_next (self):
+    def cue_next2 (self):
         i = self.state.lastcued + 1
         self.cue (i)
 
@@ -506,7 +444,7 @@ class Controller:
 
         if t == gst.MESSAGE_EOS:
             self.in_mix = False
-            self.cue_next ()
+            self.cue_next2 ()
 
         elif s == self.player1.level or s == self.player2.level:
 
@@ -528,13 +466,8 @@ class Controller:
                 pos0 = s.query_position(gst.FORMAT_TIME)[0]
                 pos1 = pos0 / 1000000000.0
                 player = pipeline.get_name()
-                dur = self.players[player].song['duration']
-                pos1int = int(pos1)
-                if pos1int % 10 == 0 and self.have_logged == False:
-                    app.logger.debug ("Position: %s, duration: %s, Level: %s" % (pos1,dur,rmsdb))
-                    self.have_logged = True
-                if pos1int % 10 != 0:
-                    self.have_logged = False
+                dur = self.players[player].duration
+                #app.logger.debug ("Position: %s, duration: %s, Level: %s" % (pos1,dur,rmsdb))
 
                 #if pos1 > 10 and pos1 < 11:
                 #    #seek_ns = pos0 + (150 * 1000000000)
@@ -543,14 +476,10 @@ class Controller:
 
                 time_left = dur - pos1
 
-                if time_left < 15 and rmsdb < -28 and not self.in_mix:
-                    try:
-                        nextplayer = self.cued.pop(0)
-                        nextplayer.play()
-                        self.in_mix = True
-                    except Exception:
-                        print "Nothing cued"
-                        #self.last_song = True
+                if time_left < 15 and rmsdb < -28 and not self.last_song and not self.in_mix:
+                    self.in_mix = True
+                    nextplayer = self.cued.pop(0)
+                    nextplayer.play()
 
 #
 #        #else:
@@ -565,26 +494,36 @@ class Controller:
                 pp.append(pl)
         return pp
 
+    def start(self):
+        # Load player1 and start playing
+        self.cue_first()
+        # Load player2
+        self.cue_next2()
+        self.playmode = True
+
+        while self.playmode:
+            if self.last_song and self.cued == [] and self.players_playing == []:
+                self.playmode = False
+            time.sleep(1)
+
+        #time.sleep(1)
+        app.loop.quit()
+
     def next (self):
         self.stop_all()
         try:
             nextplayer = self.cued.pop(0)
             nextplayer.play()
-            self.cue_next()
-        except Exception:
+            self.cue_next2()
+        except:
             print "Nothing cued"
-            #self.last_song = True
+            self.last_song = True
 
     def stop_all (self):
         for pl in self.players_playing():
             pl.stop()
 
-    def play (self, args):
-        argstr = " ".join (args)
-        if (argstr != ""):
-            self.stop_all()
-            self.state.current_song = int(argstr)
-
+    def play (self):
         if self.players_playing() == []:
             self.cue_first()
             if self.active:
@@ -596,12 +535,6 @@ class Controller:
     def pause_all (self):
         for pl in self.players_playing():
             pl.pause()
-        self.state.state = "pause"
-
-    def seek (self, args):
-        pos = int(args[0])
-        pos_ns = pos * 1000000000
-        self.active.pipeline.seek_simple(gst.FORMAT_TIME, gst.SEEK_FLAG_FLUSH, pos_ns)
 
 class App:
 
@@ -617,7 +550,7 @@ class App:
     def setup_logging(self):
         self.logger = logging.getLogger('app')
         self.logger.setLevel(self.level)
-        formatter = logging.Formatter('%(asctime)s [%(process)d] %(levelname)s: %(message)s (line %(lineno)d)','%Y-%m-%d %H:%M:%S')
+        formatter = logging.Formatter('%(asctime)s [%(process)d] %(levelname)s: %(message)s','%Y-%m-%d %H:%M:%S')
         loghandler = logging.handlers.WatchedFileHandler(self.logfile)
         loghandler.setFormatter(formatter)
         self.logger.addHandler(loghandler)
@@ -648,7 +581,6 @@ class App:
         print "                               (default: %s)" % self.logfile
         print "     --loglevel <level>        the loglevel; valid levels are <debug|info|warning|error|critical>"
         print " -v, --verbose                 equivalent to '--loglevel debug'"
-        print " -D                            do not daemonize, keep running in the foreground"
         print ""
         sys.exit(2)
 
@@ -682,7 +614,6 @@ class App:
 
     def main(self):
         #thread.start_new_thread(controller.start, ())
-        os.stat_float_times(False)
         self.setup_logging()
 
         try:
@@ -690,6 +621,7 @@ class App:
             self.logger.info("Starting controller thread")
             self.controller = Controller()
             self.controller_thread = threading.Thread(target=self.controller.start)
+            self.controller_thread.daemon = True
             self.controller_thread.start()
             self.logger.debug("Controller loop running in thread: %s" % self.controller_thread.name)
 
@@ -697,6 +629,7 @@ class App:
             self.logger.info("Starting network server on %s" % self.server_addr)
             self.server = ThreadedUnixStreamServer(self.server_addr, NetworkServer)
             self.server_thread = threading.Thread(target=self.server.serve_forever)
+            self.server_thread.daemon = True
             self.server_thread.start()
             self.logger.debug("Server loop running in thread: %s" % self.server_thread.name)
 
@@ -704,6 +637,7 @@ class App:
             self.logger.info("Starting TCP server on %s:%d" % (self.listenip, self.listenport))
             self.tcpserver = ThreadedTCPServer((self.listenip, self.listenport), NetworkServer)
             self.tcpserver_thread = threading.Thread(target=self.tcpserver.serve_forever)
+            self.tcpserver_thread.daemon = True
             self.tcpserver_thread.start()
             self.logger.debug("Server loop running in thread: %s" % self.tcpserver_thread.name)
 
@@ -717,8 +651,7 @@ class App:
 
         except IOError, err:
             self.logger.error('IO Error: %s' % err)
-            if hasattr(self, 'server'):
-                self.server.shutdown()
+            self.server.shutdown()
 
 if __name__ == "__main__":
 
